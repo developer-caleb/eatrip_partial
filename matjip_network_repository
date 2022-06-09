@@ -1,0 +1,707 @@
+import 'dart:core';
+import 'dart:io';
+
+import 'package:algolia/algolia.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:get/get.dart';
+import 'package:matjipmemo/constants/firestore_keys.dart';
+import 'package:matjipmemo/constants/logger.dart';
+import 'package:matjipmemo/controller/others_controller_deprecated.dart';
+import 'package:matjipmemo/controller/square_controller.dart';
+import 'package:matjipmemo/controller/login_controller.dart';
+import 'package:matjipmemo/controller/manager_controller.dart';
+import 'package:matjipmemo/controller/tag_controller_deprecated.dart';
+import 'package:matjipmemo/models/firebase/matjip_model.dart';
+import 'package:matjipmemo/models/firebase/user_model.dart';
+import 'package:matjipmemo/widget/dialog_widet.dart';
+
+import '../main.dart';
+import '../tools/image_tools.dart';
+import 'helper/transformers.dart';
+
+class MatjipNetworkRepository with Transformers{
+  static final MatjipNetworkRepository _matjipNetworkRepository = MatjipNetworkRepository._internal();
+  factory MatjipNetworkRepository() => _matjipNetworkRepository;
+  MatjipNetworkRepository._internal();
+
+
+  Query squareQuery = FirebaseFirestore.instance.collection(COLLECTION_MATJIP)
+      .orderBy(KEY_CREATED, descending: true).where(KEY_VISITED, isEqualTo: true)
+      .where(KEY_WRITERPRIVATE, isEqualTo: false).where(KEY_INVISIBLE, isEqualTo: false).where(KEY_WRITER_BANNED, isEqualTo: false);
+  Query otherQuery = FirebaseFirestore.instance.collection(COLLECTION_MATJIP)
+      .orderBy(KEY_CREATED, descending: true)
+      .where(KEY_WRITERPRIVATE, isEqualTo: false).where(KEY_INVISIBLE, isEqualTo: false)
+      .where(KEY_WRITER_BANNED, isEqualTo: false);
+
+
+
+
+  Stream<MatjipModel> getMatjipModelStream(String matjipId, ){
+    logger.d('맛집id->'+matjipId);
+    return FirebaseFirestore.instance.collection(COLLECTION_MATJIP).doc(matjipId).snapshots().transform(toMatjip);
+  }
+  Future<MatjipModel?> getMatjipModel(String matjipId, ) async{
+    logger.d('맛집id->'+matjipId);
+    var snapshot = await FirebaseFirestore.instance.collection(COLLECTION_MATJIP).doc(matjipId).get();
+    if(snapshot.exists){
+      return MatjipModel.fromSnapshot(snapshot);
+    }else{return null;}
+  }
+
+  Future<List<MatjipModel>> getMatjipListFromPlace(String placeid, {MatjipModel? matjipModel}) async{
+    List<MatjipModel> resultList=[];
+    var querySnapshot =await squareQuery.where(KEY_PLACE_ID, isEqualTo: placeid).get();
+    logger.d('getMatjipListFromPlace($placeid) total number : ${querySnapshot.size}');
+    for(int i=0; i<querySnapshot.docs.length;i++)
+    {
+      resultList.add(MatjipModel.fromSnapshot(querySnapshot.docs[i]));
+    }
+   /* if(resultList.length==0&& matjipModel!=null && (matjipModel.matjipid?.isNotEmpty??false)){ //다른 맛집들 없을 때 place에 맛집 추가해서 올리기
+    resultList.add(matjipModel);
+    FirebaseFirestore.instance.collection(COLLECTION_MATJIP).doc(matjipModel.matjipid).update({KEY_PLACE_ID: placeid});
+    }*/
+    return resultList;
+  }
+
+  Future<MatjipModel> likeMatjipModel({required MatjipModel matjipModel, required UserModel userModel,
+    required bool like //true -> like, false unlike
+  }) async{
+    MatjipModel newMatjipModel = matjipModel;
+    logger.d('likeMatjipModel like-> $like');
+    DocumentReference matjipRef = FirebaseFirestore.instance.collection(COLLECTION_MATJIP).doc(matjipModel.matjipid);
+    DocumentReference likerRef = matjipRef.collection(COLLECTION_LIKE).doc(userModel.uid);
+    DocumentSnapshot matjipSnapshot  = await matjipRef.get();
+    if(matjipSnapshot.exists){
+      if(like){
+        logger.d('likeMatjipModel like-> 1');
+        await FirebaseFirestore.instance.runTransaction((transaction) async{
+          transaction.update(matjipRef, {KEY_LISTOFLIKES : FieldValue.arrayUnion([userModel.uid]), KEY_COUNTLIKES : matjipModel.listoflikes.length+1});
+          transaction.set(likerRef, userModel.toJson() , SetOptions(merge: true) );
+        });
+        newMatjipModel.listoflikes.add(userModel.uid);
+        newMatjipModel.countlikes = newMatjipModel.listoflikes.length;
+      }
+      else{
+        logger.d('likeMatjipModel like-> 2');
+        await FirebaseFirestore.instance.runTransaction((transaction) async{
+          transaction.update(matjipRef, {KEY_LISTOFLIKES : FieldValue.arrayRemove([userModel.uid]), KEY_COUNTLIKES : matjipModel.listoflikes.length-1});
+          transaction.delete(likerRef,);
+        });
+        newMatjipModel.listoflikes.remove(userModel.uid);
+        newMatjipModel.countlikes = newMatjipModel.listoflikes.length;
+      }
+     // DocumentSnapshot newmatjipSnapshot  = await matjipRef.get();
+     // MatjipModel newMatjipModel = MatjipModel.fromSnapshot(newmatjipSnapshot);
+      Get.find<ManagerController>().updateMatjip(newMatjipModel);
+      Get.find<SquareController>().updateMatjip(newMatjipModel);
+      logger.d('likeMatjipModel like-> 3 $newMatjipModel');
+      //Get.find<TagController>().updateMatjip(newMatjipModel);
+     // Get.find<OthersController>().updateMatjip(matjipModel.makeruid!, newMatjipModel);
+      return newMatjipModel;
+    }else{
+      return matjipModel;
+    }
+  }
+
+
+  Future<DocumentReference> makeNewDocRef(String uid) async{
+    DocumentReference matjipRef = FirebaseFirestore.instance.collection(COLLECTION_USERS).doc(uid).collection(COLLECTION_MATJIP).doc();
+    return matjipRef;
+  }
+  Future<String> thumbUrl(String originalUrl) async{
+ try{
+   FirebaseStorage storage = FirebaseStorage.instance;
+   var ref = storage.refFromURL(originalUrl);
+   var thumbref = storage.ref('${ref.parent!.fullPath}/thumb_${ref.name}');
+   var result = await thumbref.getDownloadURL();
+   return result;
+ }catch(e){
+   return originalUrl;
+ }
+  }
+
+  Future<MatjipModel> thumbUpdate(MatjipModel matjipModel) async{
+    List imageUrls = matjipModel.imageurls;
+    List thumbUrls = [];
+    if(imageUrls.length!=0){
+      for(int i=0; i<imageUrls.length;i++)
+      {
+        var thumburl =  await thumbUrl(imageUrls[i]);
+        thumbUrls.add(thumburl);
+      }
+      matjipModel.thumbnailImageurls = thumbUrls;
+    }
+    return matjipModel;
+  }
+  void requestThumb(MatjipModel matjipModel) async{
+    //deprecated 22.05.30
+   /* if(matjipModel.imageurls.isEmpty){
+      logger.d('이미지 없음');
+      DocumentReference matjipRef=FirebaseFirestore.instance.collection(COLLECTION_MATJIP).doc(matjipModel.matjipid);
+      matjipRef.update({KEY_THUMBNAILURLS:[]});
+      return;}
+    var dio = Dio();
+    logger.d('이미지 갯수 ${matjipModel.imageurls.length}');
+    String url = "https://asia-northeast3-matjipmemo.cloudfunctions.net/generate_matjip_thumb-generate_matjip_thumb";
+    dio.get(url, queryParameters: {"matjipModel": matjipModel.toJson()});*/
+  }
+
+  Future uploadMatjip(MatjipModel matjipModel, String uid, {bool update=false, required List deleteUrls} ) async{
+    DocumentReference matjipRef = FirebaseFirestore.instance.collection(COLLECTION_MATJIP).doc(matjipModel.matjipid);
+    DocumentReference placeRef = FirebaseFirestore.instance.collection(COLLECTION_PLACES).doc(matjipModel.toPlaceId());
+    if(update){
+      matjipRef.update(matjipModel.toJson());
+      //이미지 해봐야 얼마 안 큰 데 그대로 두자! 22.06.02
+      /*FirebaseStorage storage = FirebaseStorage.instance;
+      deleteUrls.forEach((element) {
+        var ref = storage.refFromURL(element);
+        var thumbref = storage.ref('${ref.parent!.fullPath}/thumb_${ref.name}');
+        logger.d(ref.fullPath);
+        logger.d(thumbref.fullPath);
+        //ref.delete();
+       //thumbref.delete();
+        //일반 ref는 지우면 안된다.  모임이나, 리스트에서 삭제되면 아예 안나온다.
+        // thumref는 지워줘야한다.   thumb는 대표사진이라서 지워줘야 됨
+      });*/
+    }else{  matjipRef.set(matjipModel.toJson());
+      if (!matjipModel.invisible && !matjipModel.shortDescription && !matjipModel.writerprivate && matjipModel.visited)
+         placeRef.set(matjipModel.toJson()..addAll({KEY_COUNT_MATJIP: FieldValue.increment(1) }), SetOptions(merge: true));
+    }
+    logger.d('작성 완료');
+    return;
+  }
+
+
+
+
+  Future<bool> deleteMatjipModel(MatjipModel matjipModel) async{
+    var result = await realDeleteDialog();
+    if (result == false){return false;}else{
+      //맛집 지우기
+      //1.맛집이미지 파일 지우기(storage) -> 이미지 지우면, matjipMoim이나 리스트에서도 다 지워지니, 이미지는 남겨둘 것
+      /*Reference storageReference =  FirebaseStorage.instance.ref().child('$COLLECTION_USERS/${matjipModel.makeruid}/$COLLECTION_MATJIP/${matjipModel.matjipid}');
+      var listref = await storageReference.listAll();
+      var filelist = listref.items;
+      filelist.forEach((element) {
+        element.delete();
+      });*/
+      //2.맛집정보 지우기(firestore)
+      DocumentReference matjipRef = FirebaseFirestore.instance.collection(COLLECTION_MATJIP).doc(matjipModel.matjipid);
+      matjipRef.delete().then((value) => logger.d("matjipModel ${matjipModel.matjipid} Deleted"));
+      return true;
+    }
+  }
+
+  Future<String> uploadImageForWriteMatjip( {required File image, required String docname, required int index, required Timestamp timestamp1}) async{
+   // File resizedImage = await getResizeImage(image);
+    String imagesUrls='';
+    String userid = Get.find<LoginController>().userModel.value!.uid!;
+    String timestamp = timestamp1.millisecondsSinceEpoch.toString();
+    Reference storageReference =  FirebaseStorage.instance.ref()
+        .child('$COLLECTION_USERS/$userid/$COLLECTION_MATJIP/$docname/${timestamp}_$index.jpg');
+    UploadTask uploadTask = storageReference.putFile(image, SettableMetadata(contentType: "image/jpeg",));
+    logger.d('이미지 업로드 시작, $index');
+    await uploadTask.whenComplete(() async {
+      imagesUrls = await storageReference.getDownloadURL();
+    });
+    logger.d('이미지 업로드 완료!체크,imagesUrls $index-> $imagesUrls');
+    return imagesUrls;
+  }
+
+  Future<String> uploadThumbForWriteMatjip( {required File originImage, required String docname, required int index, required Timestamp timestamp1}) async{
+    File resizedImage = await getResizeImage(originImage, thumb: true);
+    String thumbUrls='';
+    String userid = Get.find<LoginController>().userModel.value!.uid!;
+    String timestamp = timestamp1.millisecondsSinceEpoch.toString();
+    Reference thumbStorageReference =  FirebaseStorage.instance.ref()
+        .child('$COLLECTION_USERS/$userid/$COLLECTION_MATJIP/$docname/thumb_${timestamp}_$index.jpg');
+    UploadTask uploadTask = thumbStorageReference.putFile(resizedImage, SettableMetadata(contentType: "image/jpeg",));
+    logger.d('이미지 업로드 시작, $index');
+    await uploadTask.whenComplete(() async {
+      thumbUrls = await thumbStorageReference.getDownloadURL();
+    });
+    logger.d('이미지 thumb 업로드 완료!체크,imagesUrls $index-> $thumbUrls');
+    return thumbUrls;
+  }
+  Future<List<dynamic>> getThumbImgUrls(List<dynamic> imageUrls) async{
+    //이거로 하면 맛집 수정할때 시간 너무 많이 걸림
+    logger.d('imageurls->'+imageUrls.toString());
+    List<String> thumbList = [];
+    for(var url in imageUrls){
+    try{
+      Reference originRef =   FirebaseStorage.instance.refFromURL(url);
+    var newRef = FirebaseStorage.instance.ref().child(originRef.parent!.fullPath+'/thumb_'+originRef.name);
+    thumbList.add(await newRef.getDownloadURL());}catch(e){
+      logger.e('thumb 오류 발생');
+    }
+    }
+    logger.d('thumbList -> $thumbList');
+    return thumbList;
+  }
+  //Deprecated 22.03.28
+ /* Future<List<MatjipModel>> readSearchMatjipList(String myuid) async {
+    logger.d("readSearchMatjipList() loaded!^^");
+    List<MatjipModel> resultList = [];
+    //내꺼랑 친구들꺼 최신 100개 가져오기?
+    await FirebaseFirestore.instance
+        .collection(COLLECTION_MATJIP)
+        .orderBy(KEY_CREATED, descending: true)
+    //.where(KEY_MAKERUID, isNotEqualTo: myuid)
+    //.orderBy(KEY_MAKERUID)
+    //.where(KEY_MAKERUID, whereNotIn: [myuid])
+        .limit(50)
+        .get()
+        .then((QuerySnapshot querySnapshot) {
+      print('querySnapshot.size->${querySnapshot.size} ');
+      querySnapshot.docs.forEach((doc) {
+        if(doc.get(KEY_MAKERUID)!=myuid){
+          resultList.add(MatjipModel.fromSnapshot(doc));
+        }
+      });
+    });
+    return resultList;
+  }*/
+
+  Future<List<MatjipModel>> queryManageMatjipList(String queryText, UserModel userModel, {int count=60,}) async{
+
+    String selectedGrouping = Get.find<ManagerController>().selectedGrouping.value;
+    String indice = '';
+    logger.d('makeruid -> ${userModel.uid}\n selectedGrouping-> $selectedGrouping',);
+      switch(selectedGrouping){
+      case '방문여부': indice= 'Matjip_Visited'; break;
+      case '지역별': indice= 'Matjip_Address'; break;
+      case '카테고리': indice= 'Matjip_Category'; break;
+      case '상호별': indice= 'Matjip_Name'; break;
+      case '날짜별': indice= 'Matjip_Created'; break;
+    }
+    AlgoliaQuery query = algolia.instance.index(indice).query(queryText);
+    // Perform multiple facetFilters
+    query = query.facetFilter('makeruid:${userModel.uid}'); //-> write mine
+
+    //TODO : 이게 일단은 내가 grouping에 대해서는 신경쓰지 않았는데, grouping을 해야할 경우에는 orderby해주면 될 듯
+    //TODO : readManageMatjipList 함수 참조할 것!
+    //query = query.facetFilter('isDelete:false');
+    query = query.setHitsPerPage(count);
+    AlgoliaQuerySnapshot snap = await query.getObjects();
+    List<AlgoliaObjectSnapshot> hits =  snap.hits;
+    List<MatjipModel> items =[];
+    hits.forEach((element) {
+      MatjipModel matjipmodel = MatjipModel.fromAlgolia(element.data,);
+      logger.d('element object id -> ${element.objectID}, ${matjipmodel.created.toDate()}');
+      items.add(matjipmodel);
+    });
+    logger.d(snap.toString());
+    return items;
+  }
+
+  Future<List<MatjipModel>> readOthersMatjipList(  {int count = 10, required String uid}) async {
+    List<MatjipModel> resultList = [];
+    QuerySnapshot snapshot= await otherQuery.where(KEY_MAKERUID, isEqualTo: uid ).limit(count).get();
+    for(QueryDocumentSnapshot doc in snapshot.docs)
+      {
+        var matjipmodel  = MatjipModel.fromSnapshot(doc);
+        resultList.add(matjipmodel);
+      }
+  return resultList;
+  }
+
+
+  Future<List<MatjipModel>> readSquareMatjipList(  {int count = 10, String? tagString, DocumentReference? lastDocref, List<dynamic>? tagList}) async {
+    logger.d("read Square MatjipList() loaded!^^ tagString: $tagString, tagList : $tagList");
+    List<MatjipModel> resultList = [];
+    Query query;
+    if (tagString!=null&&tagString.isNotEmpty){
+      query=squareQuery.where(KEY_TAGS, arrayContains: tagString );}else{query=squareQuery;}
+    if(tagList!=null)
+    {if(tagList.isNotEmpty){
+      query = query.where(KEY_TAGS, arrayContainsAny: tagList);
+    } }
+
+      if (lastDocref!=null){query = query.startAfterDocument(await lastDocref.get());}
+        await query.limit(count).get().then((QuerySnapshot querySnapshot) {
+          logger.d('query ${querySnapshot.size} 개 찾음');
+          Get.find<SquareController>().setScrollable(querySnapshot.size>=count);
+          for(QueryDocumentSnapshot doc in querySnapshot.docs)
+          {
+            var matjipmodel  = MatjipModel.fromSnapshot(doc);
+            if((Get.find<LoginController>().userModel.value?.blockingUsers?.contains(matjipmodel.makeruid)??false)||
+                (Get.find<LoginController>().userModel.value?.blockedUsers?.contains(matjipmodel.makeruid)??false)){
+              logger.d('차단됨 ${doc[KEY_MATJIPNAME]}');
+              continue;}
+            resultList.add(matjipmodel);
+          }
+    });
+    return resultList;
+  }
+  Future<List<MatjipModel>> readManageMatjipList(String myuid, {int count = 15, String? selectedGrouping= '날짜별', DocumentReference? lastDocref}) async {
+
+    logger.d("readManageMatjipList() loaded!^^  selectedGrouping $selectedGrouping");
+    List<MatjipModel> resultList = [];
+    //내꺼랑 친구들꺼 최신 100개 가져오기?
+    var query =  FirebaseFirestore.instance.collection(COLLECTION_MATJIP).where(KEY_MAKERUID, isEqualTo: myuid);
+    switch(selectedGrouping){
+      case '방문여부': query= query.orderBy(KEY_VISITED, descending: true).orderBy(KEY_CREATED, descending: true); break;
+      case '지역별': query= query.orderBy(KEY_ADDRESS_SIMPLE, ).orderBy(KEY_CREATED, descending: true); break;
+      case '카테고리': query= query.orderBy(KEY_ORDER_CATEGORY, ).orderBy(KEY_CREATED, descending: true); break;
+      case '상호별': query= query.orderBy(KEY_MATJIPNAME, ); break;
+      case '날짜별': query= query.orderBy(KEY_CREATED, descending: true);break;
+    }
+    if (lastDocref!=null){query = query.startAfterDocument(await lastDocref.get());}
+    await query.limit(count).get().then((QuerySnapshot querySnapshot) {
+      querySnapshot.docs.forEach((doc) {
+
+        resultList.add(MatjipModel.fromSnapshot(doc));
+      });
+    });
+    return resultList;
+  }
+  Future<List<MatjipModel>> fetchMatjipList(DocumentReference documentReference, {UserModel? filterUser}) async {
+    logger.d("fetch MatjipList() loaded!^^ filterUser-> ${filterUser?.nickname}");
+    List<MatjipModel> resultList = [];
+    //내꺼랑 친구들꺼 최신 100개 가져오기?
+    Query query;
+    if(filterUser== null){
+      //square
+      query = squareQuery;
+    }else{
+      //manager
+      query = FirebaseFirestore.instance
+          .collection(COLLECTION_MATJIP).where(KEY_MAKERUID, isEqualTo: filterUser.uid)
+          .orderBy(KEY_CREATED, descending: true);
+    }
+    await query
+        .endBeforeDocument(await documentReference.get())
+        .limit(50)
+        .get()
+        .then((QuerySnapshot querySnapshot) {
+      querySnapshot.docs.forEach((doc) {
+        logger.d("fetch MatjipList doc ->"+doc[KEY_MATJIPNAME]);
+        resultList.add(MatjipModel.fromSnapshot(doc));
+      });
+    }).onError((error, stackTrace) async{
+      await Future.delayed(Duration(milliseconds: 200));
+      fetchMatjipList(documentReference);
+    });
+    return resultList;
+  }
+
+  Future<List<MatjipModel>> readFollowMatjipList(  {int count = 4, String? tagString, DocumentReference? lastDocref}) async {
+    logger.d('follow matjip LIst');
+    UserModel? myUserModel = Get.find<LoginController>().userModel.value;
+    if(myUserModel==null){return [];}
+    logger.d("read Square MatjipList() loaded!^^ tagString: $tagString");
+    List<MatjipModel> resultList = [];
+    Query query;
+    query=squareQuery;
+    query = query.where(KEY_MAKERUID, whereIn: myUserModel.following);
+    if (lastDocref!=null){query = query.startAfterDocument(await lastDocref.get());}
+    await query.limit(count).get().then((QuerySnapshot querySnapshot) {
+      for(QueryDocumentSnapshot doc in querySnapshot.docs)
+      {
+        var matjipmodel  = MatjipModel.fromSnapshot(doc);
+        if((Get.find<LoginController>().userModel.value?.blockingUsers?.contains(matjipmodel.makeruid)??false)||
+            (Get.find<LoginController>().userModel.value?.blockedUsers?.contains(matjipmodel.makeruid)??false)){
+          logger.d('차단됨 ${doc[KEY_MATJIPNAME]}');
+          continue;}
+        resultList.add(matjipmodel);
+      }
+    });
+    return resultList;
+  }
+
+  Future<List<MatjipModel>> existMyMatjips(UserModel userModel, String placeId) async{
+    List<MatjipModel> resultList =[];
+    var query  = await FirebaseFirestore.instance.collection(COLLECTION_MATJIP).where(KEY_MAKERUID, isEqualTo: userModel.uid)
+        .where(KEY_PLACE_ID, isEqualTo: placeId).get();
+    logger.d('읽어 들인 doc 수 -> ${query.docs.length} , $placeId' );
+    query.docs.forEach((doc) async{
+      logger.d("fetch MatjipList doc -> ${doc.id}");
+      resultList.add(MatjipModel.fromSnapshot(doc));
+    });
+    return resultList;
+  }
+
+  Future<int> queryWithTag(String queryText, {int count = 40}) async{
+    var query  = await FirebaseFirestore.instance.collection(COLLECTION_MATJIP).where(KEY_TAGS, arrayContains: queryText)
+    .limit(count).get();
+    logger.d('읽어 들인 doc 수 -> ${query.docs.length}' );
+    return query.docs.length;
+  }
+
+  Future<List<MatjipModel>> getAlgoliaWithTag(String queryText) async{
+    AlgoliaQuery query = algolia.instance.index('MATJIP').query(queryText);
+    query = query.setHitsPerPage(3);
+    AlgoliaQuerySnapshot snap = await query.getObjects();
+    List<AlgoliaObjectSnapshot> hits =  snap.hits;
+    List<MatjipModel> items =[];
+    hits.forEach((element) {
+      MatjipModel matjipmodel = MatjipModel.fromAlgolia(element.data,);
+      print('element object id -> ${element.objectID}, ${matjipmodel.created.toDate()}');
+      items.add(matjipmodel);
+    });
+    return items;
+  }
+
+  Future<List<MatjipModel>> getMyMatjipList(String userUid,  {int count = 10}) async{
+    List<MatjipModel> resultList = [];
+    var query  = await FirebaseFirestore.instance.collection(COLLECTION_MATJIP).where(KEY_MAKERUID, isEqualTo: userUid)
+        .limit(count).get();
+    logger.d('읽어 들인 doc 수 -> ${query.docs.length}' );
+    query.docs.forEach((doc) async{ resultList.add(MatjipModel.fromSnapshot(doc));});
+    return resultList;
+  }
+/*  Future<List<MatjipModel>> getMatjipLikeList(String matjipid,  {int count = 20}) async{
+    List<MatjipModel> resultList = [];
+    var query  = await FirebaseFirestore.instance.collection(COLLECTION_USERS).where(KEY_UID, isEqualTo: userUid)
+        .limit(count).get();
+    logger.d('읽어 들인 doc 수 -> ${query.docs.length}' );
+    query.docs.forEach((doc) async{ resultList.add(MatjipModel.fromSnapshot(doc));});
+    return resultList;
+  }*/
+
+
+
+ /*Future allmatjipSetting() async{
+  var query  = await FirebaseFirestore.instance.collection(COLLECTION_MATJIP).orderBy(KEY_MATJIPNAME).get();
+  logger.d('읽어 들인 doc 수 -> ${query.docs.length}' );
+  query.docs.forEach((doc) async{
+    logger.d("fetch MatjipList doc -> ${doc[KEY_MATJIPID]}");
+    var matjipmodel =  MatjipModel.fromSnapshot(doc);
+    var created  = matjipmodel.created;
+    var categoryName  = matjipmodel.categoryName;
+    matjipmodel.orderDate = DateFormat('yy.MM.',).format(created.toDate());
+   try{
+     if (categoryName!=null){
+       matjipmodel.orderCategory = categoryName.split('>')[1].trim();
+     }else{
+       matjipmodel.orderCategory = '🥘 기타';
+     }
+   }catch(e){
+     matjipmodel.orderCategory = '🥘 기타';
+   }
+    await FirebaseFirestore.instance.collection(COLLECTION_MATJIP).doc(matjipmodel.matjipid).set(matjipmodel.toJson(),SetOptions(merge: true) );
+  });
+  return;
+ }
+  Future allmatjipDatafromKaKaoForAdmin() async{
+    var query  = await FirebaseFirestore.instance.collection(COLLECTION_MATJIP).orderBy(KEY_MATJIPNAME).get();
+    logger.d('읽어 들인 doc 수 -> ${query.docs.length}' );
+    for(int i=0; i<query.docs.length;i++)
+    {
+      logger.d("1fetch MatjipList doc -> ${query.docs[i][KEY_MATJIPID]}");
+      var matjipmodel =  MatjipModel.fromSnapshot(query.docs[i]);
+
+
+      Map<String, dynamic> map = matjipmodel.toJson();
+
+      KakaoPlaceModel? kakaoPlaceModel = await searchNetworkRepository.findKakaoPlaceWithQuery(matjipmodel.matjipname??'', matjipmodel.geolocation??GeoPoint(37.565760, 126.977927));
+      if(kakaoPlaceModel==null){logger.d('kakaoPlaceModel == null'); continue;}
+      if(kakaoPlaceModel.documents!.isNotEmpty){
+        kakaoPlaceModel.documents!.sort((a, b) => a.distance!.compareTo(b.distance!));
+      }
+      KaKaoPlaceDocument? selectedMatjip;
+
+       await Get.dialog(  AlertDialog(
+         title: Text('${matjipmodel.matjipname}, ${matjipmodel.address}'),
+         content: SingleChildScrollView(
+           child: Column(
+             children: List.generate(
+                 kakaoPlaceModel.documents?.length ?? 0, (index) =>
+                 InkWell(
+                   onTap: (){
+                   },
+                   child: Container(
+                     color: index==0? Colors.grey: Colors.white,
+                     child: Row(
+                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                       children: [
+                         Text('${kakaoPlaceModel.documents![index].placeName}?'),
+                         Text('${kakaoPlaceModel.documents![index].distance}m')
+                       ],
+                     ),
+                   ),
+                 )),
+           ),
+         ),
+         actions: [
+           TextButton(onPressed: () {
+             Get.back();
+             selectedMatjip = kakaoPlaceModel.documents![0];
+           }, child: Text('확인')),
+           TextButton(onPressed: () {
+             Get.back();
+           }, child: Text('취소')),
+         ],
+       )
+     );
+
+
+      if(selectedMatjip!=null)
+     {
+       logger.d('selectmatjip is not null');
+       var addresssimpleList  = selectedMatjip!.roadAddressName!.split(" ");
+     map[KEY_MATJIPNAME]= selectedMatjip!.placeName;
+     map[KEY_ADDRESS]= selectedMatjip!.roadAddressName;
+     map[KEY_CATEGORY_GROUP_NAME]=  selectedMatjip!.categoryGroupName;
+     map[KEY_CATEGORY_NAME]=  selectedMatjip!.categoryName;
+     map[KEY_KAKAO_ID]=  selectedMatjip!.id;
+     map[KEY_PHONE]=  selectedMatjip!.phone;
+     map[KEY_KAKAO_URL]=  selectedMatjip!.placeUrl;
+     map[KEY_PLACE_ID] = '${selectedMatjip!.placeName}_${selectedMatjip!.lat!}_${selectedMatjip!.lng!}';
+     map[KEY_GEO_LOCATION] = GeoPoint(selectedMatjip!.lat!.toDouble(), selectedMatjip!.lng!.toDouble());}else{
+        logger.d('selectmatjip is null');
+      }
+
+      await FirebaseFirestore.instance.collection(COLLECTION_MATJIP).doc(matjipmodel.matjipid).set(map,SetOptions(merge: true) );
+
+    }
+ *//*   query.docs.forEach((doc) async{
+         });*//*
+    return;
+  }
+*/
+
+
+
+
+
+
+
+  //카카오로 대체 됨 22.02.13 -> 외국 서버에 필요함 지우지 말 것
+/*  Future<List<GoogleLocation>> searchNearbyMatjipListFromGoogle() async{
+    var position = await getPosition();
+    logger.d("matjip near search list");
+    logger.d("{position.longitude} : ${position.longitude} + {position.latitude} :${position.latitude} ");
+
+    var matjipQueryRequest = await Dio().request(
+        "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+        queryParameters: {
+          "type": "restaurant",
+          "key": myGoogleApiKey,
+          "location": "${position.latitude} , ${position.longitude}",
+          "language": "ko",
+          //"keyword": "맛집",
+         // "radius": "1000",
+          "rankby": "distance",
+         // "type": "food",
+        });
+    logger.d("matjip near search list 돌아가야할까? ${matjipQueryRequest.data["results"].toString()}");
+    List<GoogleLocation> resultArray=[];
+    resultArray.addAll(List.generate(matjipQueryRequest.data["results"].length, (index) =>
+        GoogleLocation.fromNearbyJson(matjipQueryRequest.data["results"][index])));
+    return resultArray;
+  }*/
+
+  //카카오로 대체 됨 22.02.13 -> 외국 서버에 필요함 지우지 말 것
+/*  Future<List<GoogleLocation>> searchMatjipListWithQueryFromGoogle(String query) async{
+    var position = await getPosition();
+    print("matjip near search list with query");
+    print("{position.longitude} : ${position.longitude} + {position.latitude} :${position.latitude} ");
+   *//* var matjipQueryRequest = await Dio().request(
+        "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+        queryParameters: {
+          "key": myGoogleApiKey,
+          "location": "${position.latitude} , ${position.longitude}",
+          "radius": "800000",
+          //"type": "food",
+          "type": "restaurant",
+          "language": "ko",
+          "keyword": query,
+         // "rankby": "distance",
+        });*//*
+
+    var matjipQueryRequest = await Dio().request(
+        "https://maps.googleapis.com/maps/api/place/textsearch/json",
+        queryParameters: {
+          "type": "food",
+          "query": query,
+          "key": myGoogleApiKey,
+          "location": "${position.latitude} , ${position.longitude}",
+          //"radius": "800000",
+          //"type": "food",
+          "language": "ko",
+          // "rankby": "distance",
+        });
+    logger.d("matjip near search list with query 돌아가야할까? ${matjipQueryRequest.data["results"].toString()}");
+    List<GoogleLocation> resultArray=[];
+    resultArray.addAll(List.generate(matjipQueryRequest.data["results"].length, (index) =>
+        GoogleLocation.fromJson(matjipQueryRequest.data["results"][index])));
+    return resultArray;
+  }*/
+
+  //카카오로 대체 됨 22.02.13 -> 외국 서버에 필요함 지우지 말 것
+/*  Future<List<String>> autoCompleteListFromGoogle(String query) async{
+    var position = await getPosition();
+    print("matjip autoCompleteList");
+    logger.d("{position.longitude} : ${position.longitude} + {position.latitude} :${position.latitude} ");
+    var matjipQueryRequest = await Dio().request(
+        "https://maps.googleapis.com/maps/api/place/queryautocomplete/json",
+        queryParameters: {
+          "input": query,
+          "key": myGoogleApiKey,
+          "location": "${position.latitude} , ${position.longitude}",
+          "radius": "30000",
+          "type": "food",
+          "language": "ko",
+     //     "rankby": "distance",
+        });
+    logger.d("autoCompleteList? ${matjipQueryRequest.data["predictions"].toString()}");
+    List<String> resultArray=[];
+
+    for(int i=0;i<matjipQueryRequest.data["predictions"].length; i++){
+      var newstring =matjipQueryRequest.data["predictions"][i]["structured_formatting"]["main_text"];
+      if(resultArray.indexOf(newstring)==-1){
+        resultArray.add(newstring);
+      }
+    }
+
+
+    return resultArray;
+  }*/
+
+
+
+
+
+
+
+
+
+
+}
+
+MatjipNetworkRepository matjipNetworkRepository = MatjipNetworkRepository();
+
+
+/*
+22.02.17 삭제
+Future<FirebaseFolderModel> addPersonalFolder( {required String folderName, required UserModel userModel}) async{
+  late FirebaseFolderModel folderModel;
+  DocumentReference folderRef = FirebaseFirestore.instance.collection(COLLECTION_FOLDERS).doc();
+  DocumentReference userRef = FirebaseFirestore.instance.collection(COLLECTION_USERS)
+      .doc(userModel.uid);
+  final DocumentSnapshot folderSnapshot = await folderRef.get();
+  final DocumentSnapshot userSnapshot = await userRef.get();
+  if(!folderSnapshot.exists&& !userSnapshot.exists){
+    await FirebaseFirestore.instance.runTransaction((transaction) async{
+      var newfolderModel = {
+        "created": Timestamp.now(),
+        "update": Timestamp.now(),
+        "folderid": folderRef.id,
+        "foldername": folderName,
+        "makerimg": userModel.userimg,
+        "makeruid": userModel.uid,
+        "makername": userModel.nickname,
+      };
+
+      transaction.set(folderRef, newfolderModel);
+      transaction.update(userRef, {KEY_FOLDERS: FieldValue.arrayUnion([newfolderModel])});
+      // await Get.find<MatjipController>().addFolder(FirebaseFolderModel.fromMap(newfolderModel));
+      folderModel= FirebaseFolderModel.fromMap(newfolderModel);
+    });
+
+  }else{showToast('잠시 후 다시 시도해주세요.');}
+  print('작성 완료');
+  return folderModel;
+}*/
